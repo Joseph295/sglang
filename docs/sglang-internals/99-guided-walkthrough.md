@@ -341,6 +341,50 @@ reasoning(`<think>`)/function-call 解析**不在 detokenizer**，在 OpenAI ada
 
 ---
 
+## 8. 计算层：Attention 后端、MoE 与算子
+
+模型前向真正发生计算的地方。回扣 14 章"模型本体不区分 prefill/decode，区别全在 attention backend"。
+
+### RadixAttention layer 怎么把 KV pool 接进 kernel
+模型每层持有一个 `RadixAttention` 实例（几乎不算东西，只存 `layer_id` + head 配置），`forward` 转发给 `forward_batch.attn_backend.forward(...)`。
+> ★ **backend 是全局单例，RadixAttention 是每层一个**。metadata（kv_indptr/kv_indices/cuda graph buffer）整个 batch 共享，每次 forward 只算一次；每层差异只有 layer_id。这样不重复算 metadata，又能让所有层走同一份 cuda graph。
+
+两条线：写线 `set_kv_buffer(layer, out_cache_loc, k, v)`；读线 kernel 用 `get_key_buffer(layer_id)` + `kv_indices` gather。
+> ★ 全貌：**layer 提供 layer_id 选行，backend 提供 kv_indices 选 token，kernel 直接在 pool 连续显存上 gather+attention**。不拷贝、不拼接 KV——RadixAttention + paged KV 高效的核心。`TorchNativeAttnBackend` 是最易读的慢速参考/ground truth。
+
+### backend 选择：先定字符串，再实例化
+> ★ 同一个 `"flashinfer"` 字符串按 `use_mla_backend` 落到两个不同类（MHA vs MLA KV 布局不同）。"看着一个 backend、实际两套实现"的坑。
+
+### MoE：TP vs EP（回扣 15 章）
+| | 专家权重 | 通信 | 类 |
+|---|---|---|---|
+| TP | 每 rank 全量持有 | all-reduce | FusedMoE |
+| EP | 每 rank 部分专家 | all-to-all dispatch/combine | EPMoE/DeepEPMoE |
+
+路由统一走 `select_experts` → `(topk_weights, topk_ids)`。
+> ★ DeepSeek grouped topk：先分组打分、选组、组内选专家——限制跨节点通信。`on_select_experts` 记录专家负载 = **EPLB(25章) 的数据来源**；逻辑→物理专家号映射是在线搬专家的钩子。TP vs EP 是显存与通信的权衡。
+
+### LogitsProcessor：核心难点是剪枝
+> ★ 大多数情况只需每 seq 最后一个 token 的 logits（vocab 维巨大）。复杂度全在"要不要 input logprob"——三索引逻辑（`logits_processor.py:288-330`）是 logprob bug 高发区。lm_head 词表并行，需 all-gather 拼回完整分布。
+
+### 量化：方法对象模式
+> ★ **接新量化 = 写新 `LinearMethodBase` 子类（create_weights + apply），不碰 layer**。同一个 QKVParallelLinear 能在 fp16/fp8/awq 间切换。`prefix`（层全名）支持按层名 mixed-precision。坏处：method↔layer 契约隐式，易踩 shape 不匹配。
+
+### CustomOp 分发 + torch.compile 隐藏约束
+RMSNorm/SiluAndMul/RoPE 继承 CustomOp 按平台分发。`fused_add_rmsnorm` 原地改 x+residual。
+> ★ **torch.compile 是隐藏约束**：多处为编译让路（RMSNorm 编译期强制 native、`q.reshape` 绕 rotary_emb 在 compile 下的 3D bug）。改算子务必同时测 eager 和 compile。
+
+### 新增 attention backend（最常见需求）
+```
+1. 写类(继承 AttentionBackend): init_forward_metadata + forward_extend + forward_decode
+2. init_attention_backend 加 elif 懒加载  3. server_args choices 加名字  4.(可选)自动选择
+```
+> ★ **最小可跑路径**：复制 `TorchNativeAttnBackend`，换 kernel，关 cuda graph 跑通，用它的输出做数值对拍。
+
+参考：[16-layers-attention-moe](16-layers-attention-moe.md)
+
+---
+
 ## 学习建议
 
 1. **动手胜过读**：`python -m sglang.srt.mem_cache.radix_cache` 玩 radix 树；`--disable-overlap-schedule` / `--disable-cuda-graph` 二分定位 bug。
