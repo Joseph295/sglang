@@ -458,6 +458,34 @@ mooncake(线程池并发逐层)/nixl(一次 xfer 走 GPUDirect)/fake(warmup)。`
 
 ---
 
+## 11. EPLB：专家并行负载均衡
+
+### 解决什么
+> ★ MoE router 学出来天然不均衡——热门专家被路由的 token 远多于others，大规模 EP 下持有热门专家的 GPU 成瓶颈。EPLB 运行时**统计专家热度 → 算更优物理放置(含冗余副本) → 不重启搬权重**。三块：record → rebalance → update。挂在 forward 之后的**旁路控制环路**。
+
+### 地基：logical vs physical + 冗余副本
+> ★ logical = 模型真实专家(router 输出 logical id)；physical = 放在某 GPU 上的一份权重 = num_logical + 冗余。**冗余副本=把热门专家复制多份分散到不同 GPU**。logical→physical 解耦让 router 不变、放置可独立变化。`ExpertLocationMetadata` 4 张表，关键是 `logical_to_rank_dispatch_physical_map`(给当前 rank 预选的副本)。
+
+### ① record 统计
+forward 用 `with_forward_pass` 包住，MoE topk 后 `on_select_experts`(回扣16章)喂 gatherer。
+> ★ 开销 vs 精度：朴素 gatherer 搬 CPU 计数慢；**DeepEP 路径复用 dispatch 已算好的 count 零开销**(大规模部署配 DeepEP 的原因)。一卡只看自己那段,all-reduce(SUM)拼全局;dump 时 scatter_add_ 把物理计数折回逻辑计数。
+
+### ② rebalance 算法
+`make_redundant_experts_chunkwise`：贪心放冗余(给"分摊后负载最高"的专家加副本,打分 tokens/(count+1)) + GPU 间蛇形二次均衡。
+> ★ **刻意制造"互不相等分数"**(加 1e-4*arange)：各 rank 独立跑算法必须算出**完全一致**放置,有并列会导致不同 rank 选不同 = 灾难。分布式确定性经典技巧。**prefill/decode 不同算法**(回扣21):prefill 考虑 group/node 局部性先 pack_groups,decode 直接全局 chunkwise,phase 由 disaggregation_mode 推断。
+
+### dispatch 翻译 + ③ update 搬权重
+forward 用 `topk_ids_logical_to_physical` 翻译(static 查表本地优先/dynamic 实时随机)。update 先搬权重再 `metadata.update()` 原地覆盖 4 表(dispatch 端立刻生效)。单层搬运 5 种 case(unchanged/same-gpu/free-rider/same-node/cross-node)。
+> ★ **free-rider(case3)依赖"按 dst 升序遍历"**(后槽复用前槽已收数据),打乱顺序就破坏——隐式契约易踩。P2P 配对不上会全体死锁。
+
+### 修 bug
+精度骤降(dump 用那一刻的旧 map)、各 rank 放置不一致(全局 logical_count + 互不相等分数 trick)、update hang(P2P 配对,debug=True 看 case)、dump 全 0(忘 start_record)。
+> ★ **circular buffer 耦合**:断言 `eplb_rebalance_num_iterations <= buffer_size`,否则混入陈旧数据。开 `--enable-expert-distribution-metrics` 看 balancedness(越近 1 越均衡)。
+
+参考：[25-eplb-expert-parallel](25-eplb-expert-parallel.md)
+
+---
+
 ## 学习建议
 
 1. **动手胜过读**：`python -m sglang.srt.mem_cache.radix_cache` 玩 radix 树；`--disable-overlap-schedule` / `--disable-cuda-graph` 二分定位 bug。
