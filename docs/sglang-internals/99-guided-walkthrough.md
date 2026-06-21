@@ -486,6 +486,32 @@ forward 用 `topk_ids_logical_to_physical` 翻译(static 查表本地优先/dyna
 
 ---
 
+## 12. Multi-LoRA 批处理
+
+### 数学简单，难点全在工程
+```
+y = x W + scaling*(x A^T)B^T    A:(r,in) B:(out,r) r≪in/out
+```
+> ★ 难点不在数学：怎么让 batch 每行用对的 A/B、怎么省显存(挂100个不占100份)、怎么和 CUDA graph/TP 共存。思想来自 S-LoRA + Punica。寄生在 forward 的 linear 层,scheduler 组 batch 时准入(distinct adapter ≤ max_loras_per_batch)。
+
+### 四阶段
+- **A 加载+stack**：把 q/k/v 的 lora_A cat 成 qkv_proj、gate/up 拼成 gate_up_proj。
+  > ★ 为什么 stack？base model 本身把 q/k/v 融成 QKVParallelLinear(回扣16)，LoRA 必须对齐。**补零陷阱**:只对 q 做 LoRA 没给 k/v 会 zeros_like 补零,可能静默错误。
+- **B monkey-patch**：命中 target 的 linear 原地换成 LoRA 版,forward = base GEMM + `if set_lora: apply_lora`。
+- **C 换入(显存池精髓)**：只有 max_loras_per_batch 个 slot,所有 adapter 共享按需换入换出。
+  > ★ **S-LoRA 核心**:显存只和 max_loras_per_batch 有关,**与挂载多少 adapter 无关**。切换开销只在冷 adapter(H2D 拷贝),热 adapter 零拷贝复用。uid=None(base-only)也是合法 key,slot 清零走同一 kernel。
+- **D segmented GEMM(核心优化)**：x 拍平成 (s,in)，LoRABatchInfo(seg_indptr/weight_indices/lora_ranks/scalings)当导航图,kernel 里 `w_index=weight_indices[batch_id]` 选权重、`lora_ranks` 动态裁剪。
+  > ★ **一次 launch 覆盖整 batch,每段自动路由到对的 adapter/rank/scaling**(Punica/S-LoRA)。不逐 adapter 循环是因为 launch 开销+decode 瘦 GEMM 利用率差。**rank 不一**:buffer 按 max_lora_dim 分配,kernel 用 lora_ranks 收缩到真实 rank(flashinfer 不支持,要求同 rank)。
+
+### TP + CUDA graph 共存
+> ★ **TP 切分在换入时**做,池里存本 rank 分片 kernel 无需感知 TP;切错维度=TP>1 错乱 TP=1 正常(最隐蔽)。**CUDA graph** 单独一套 cuda_graph_batch_info,原地 in-place 更新;capture 时 lora_path=None 要替换占位。
+
+调试:确认 target_modules 被支持→打印 stack 后 key(应是 qkv_proj)→打印 weight_indices/lora_ranks→数值不对先关 cuda graph 切 triton。
+
+参考：[22-lora](22-lora.md)
+
+---
+
 ## 学习建议
 
 1. **动手胜过读**：`python -m sglang.srt.mem_cache.radix_cache` 玩 radix 树；`--disable-overlap-schedule` / `--disable-cuda-graph` 二分定位 bug。
