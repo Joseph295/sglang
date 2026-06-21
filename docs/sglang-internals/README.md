@@ -102,6 +102,7 @@ SGLang 把「HTTP 接入 + 分词」「调度 + 前向 + 采样」「解码」�
 | --- | --- |
 | [90-data-structures.md](90-data-structures.md) | **核心数据结构速查**：Req / ScheduleBatch / ForwardBatch 等关键类字段速查。 |
 | [91-debugging-and-hacking.md](91-debugging-and-hacking.md) | **调试与魔改速查**：常见 bug 定位入口、日志/断点位置、改代码的安全边界。 |
+| [99-guided-walkthrough.md](99-guided-walkthrough.md) | **配套导读（老师带读）**：口语化串讲主链路 + ★Insight，强调"为什么这么设计"，适合从头读一遍建立心智模型。 |
 
 ---
 
