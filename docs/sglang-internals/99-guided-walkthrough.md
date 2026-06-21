@@ -424,6 +424,40 @@ verify: 重新为 num_verify_tokens 分配 → 只保留接受的, free 拒绝�
 
 ---
 
+## 10. PD 分离（Prefill/Decode Disaggregation）
+
+### 为什么拆
+> ★ prefill 是 **compute-bound**（算整段 prompt，算力打满），decode 是 **memory-bound**（每步 1 token，瓶颈在 KV 带宽）。同实例上 prefill 会打断 decode 造成 TBT 抖动。拆开后**两类实例各自选最优并行**（prefill `deepep normal` 吞吐优先，decode `low_latency` 延迟优先）。根本动机是各自最优,不是省资源。
+
+### 架构：客户端连 LB 不连实例
+```
+客户端 → mini_lb(选一对 P+D, 注入 bootstrap 三元组, 同时 POST 两台)
+prefill: 分词→extend→采1个token→KVSender ─RDMA WRITE─► decode 显存
+decode:  预分配KV槽→KVReceiver 收→假extend(跳过prefill)→正常decode→响应
+```
+> ★ bootstrap 三元组(host/port/room)：room 是请求全局 ID 用来**配对** prefill/decode。**prefill 只采 1 token**(max_new_tokens=1)+logprobs 作 aux 单独传，decode 用**"假 extend"**接上当起点。**传输方向是 prefill 主动 WRITE 到 decode**(single-sided)。
+
+### 两类实例复用同一 Scheduler，只换 event loop
+- prefill 三段：Bootstrap(等 decode 注册地址)→Waiting(extend forward)→Inflight(send_kv_chunk 传输)。
+- decode 四段：Prealloc(握手+预分配)→Transfer(poll+读首token)→Waiting(假extend)→Running(正常decode)。
+> ★ **"假 extend"** `process_prebuilt_extend` 只填 metadata 不跑 forward(KV 已传来)，骗过后续 decode 逻辑。**decode 死锁防护** `_allocatable_tokens` 为传输中/等待的请求预留 decode 空间(num_reserved_decode_tokens=512),否则"KV 传来了没地方 decode"。
+
+### 最烧脑：prefill/decode TP size 不一致
+> ★ 三种情况(仅 MLA 支持不等)。**dummy 请求**是精髓：decode TP < prefill TP 时对不要数据的 prefill rank 发 dummy 凑数，因为 prefill 要收齐 `required_dst_info_num` 才翻 WaitingForInput，否则**永久卡 Bootstrapping**。状态机用 `max(old,new)` 合并保证单调前进(prefill 可能先收 decode 注册后设自己状态)。
+
+### KV transfer 后端
+mooncake(线程池并发逐层)/nixl(一次 xfer 走 GPUDirect)/fake(warmup)。`group_concurrent_contiguous` 合并连续块减少 RDMA 描述符。
+> ★ **overlap 下 KV 传输要延迟**：不立即 send_kv_chunk,推迟到 result resolve 后,否则传到尚未算完的 KV（又一处 overlap 时序陷阱）。
+
+### KV events（独立机制）
+把"KV block 存入/移除 radix tree"ZMQ PUB 广播,供外部 KV-aware 路由器订阅做 prefix-aware 路由。带 seq + replay buffer 实现 at-least-once。
+
+修 bug：卡 Bootstrapping(dummy/required_dst_info_num)、高并发 hang(手动 reset batch_is_full)、KV 乱码(page 对齐/分组/overlap 延迟)、decode 死锁(预留不足)。调试用 FAKE 后端排除 RDMA。
+
+参考：[21-pd-disaggregation](21-pd-disaggregation.md)
+
+---
+
 ## 学习建议
 
 1. **动手胜过读**：`python -m sglang.srt.mem_cache.radix_cache` 玩 radix 树；`--disable-overlap-schedule` / `--disable-cuda-graph` 二分定位 bug。
