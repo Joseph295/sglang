@@ -385,6 +385,45 @@ RMSNorm/SiluAndMul/RoPE 继承 CustomOp 按平台分发。`fused_add_rmsnorm` �
 
 ---
 
+## 9. 投机解码（EAGLE）— 高级特性
+
+### 一句话原理
+> ★ 普通 decode：1 次 target 前向 = 1 token。投机解码：小而快的 **draft 模型（EAGLE 头）**猜出多个候选组成**候选树**，大而慢的 **target 模型一次前向并行验证整棵树**，接受最长合法前缀 = 1 次 target 前向产出多个 token。**不改变输出分布**（数学等价于直接从 target 采样），只加速不降质。trade-off：draft 猜得准就赚。
+
+替换了正常 decode 的"前向+采样"：`run_batch` 看 `spec_algorithm.is_none()` 分发到 `EAGLEWorker.forward_batch_speculative_generation`。
+
+### decode 三段式
+```
+spec_info(topk_p,topk_index,hidden_states)  ← 上步留的猜测种子
+ draft()    多步 draft 前向逐层展开候选树
+ build_tree 压成扁平树(draft_token + tree_mask + retrive 索引)
+verify()    target 1 次大前向 → 接受/拒绝 → free 未接受 KV
+ draft_extend_after_decode  用接受 token 重喂 draft 算下步 topk_*
+```
+- **draft**：`select_top_k_tokens` beam-search 式逐层剪枝。树宽=topk，深=num_steps。
+  > ★ EAGLE draft 吃 **target hidden state + 下一 token embedding**，输入要错位一位（"左移一位"）。
+- **build_tree**：产出 tree_mask（每候选只 attend 祖先链）/ positions / retrive_*。
+  > ★ 搞懂树张量直接读单测 `test_build_tree_kernel_efficient`（带硬编码断言）——读复杂 kernel 的通用技巧。
+- **verify**：greedy 沿 retrive 链最长匹配，或树版投机采样保证分布一致。
+  > ★ **bonus token**：`seq_lens.add_(accept_length+1)` 那个 +1——哪怕全拒绝，target 根位置预测也是一个合法 token，所以每步至少产出 1 个，永不比普通 decode 慢。
+
+### 最难点：投机 KV 的"分配→回滚→部分释放"
+```
+draft: 乐观给 topk*num_steps 候选全分配 KV + backup_state → 跑完 restore_state
+verify: 重新为 num_verify_tokens 分配 → 只保留接受的, free 拒绝的(evict_mask)
+```
+> ★ `evict_mask` 与 `accept_index` 对应是 KV bug 头号高发区（漏 free→OOM，多 free→乱码）。`page_size>1` 强制 `topk=1`（释放要按页对齐，topk>1 还没实现）。
+
+### 专用 CUDA graph
+> ★ draft 多步循环 in-place 改 `out_cache_loc`/`hidden_states`，`EAGLEDraftCudaGraphRunner` 捕获前后必须**备份还原**这两字段（回扣 14 章 graph "固定地址"本质）。draft 用专用 runner，verify(TARGET_VERIFY) 用 target 普通 runner，DRAFT_EXTEND 不走 graph。
+
+### 认知负担
+> ★ `forward_batch_speculative_generation` docstring 警告：**batch 很多字段执行中被 in-place 改，最终状态≠入参**。看到值"莫名变了"先怀疑某步 in-place。三参数 num_steps/topk/num_draft_tokens 强耦合（server_args.py:409 自动调整）。
+
+参考：[20-speculative-eagle](20-speculative-eagle.md)
+
+---
+
 ## 学习建议
 
 1. **动手胜过读**：`python -m sglang.srt.mem_cache.radix_cache` 玩 radix 树；`--disable-overlap-schedule` / `--disable-cuda-graph` 二分定位 bug。
