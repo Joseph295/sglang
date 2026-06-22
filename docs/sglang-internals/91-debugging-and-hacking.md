@@ -8,6 +8,20 @@
 
 ---
 
+## 0. 速记卡（TL;DR）：最高杠杆的几招
+
+> 贴在工位上的版本。原理与展开见后文对应小节，**进阶技巧见 §8**。
+
+1. **二分关优化定位 bug**：`--disable-cuda-graph` →（还在）`--disable-overlap-schedule` →（还在）`--disable-radix-cache`。bug 在哪一步消失，问题就在那条路径里。（§5.6 / §7.6）
+2. **用 `rid` 串起三个进程的日志**：开 `--log-requests`，一条请求的 `rid` 贯穿 TokenizerManager / Scheduler / DetokenizerManager —— 这是多进程下追一条请求的唯一线索。（§8.1）
+3. **不起 server，单进程跑一个 batch**：`python -m sglang.bench_one_batch ... --load-format dummy`，没有 ZMQ / HTTP，断点 print 直达；加 `--correct` 和 HF 对拍数值。（§7.2 / §7.3）
+4. **数值对拍用「慢但可信」的实现做 ground truth**：attention 用 `--attention-backend torch_native`、采样用 `--sampling-backend pytorch`、整模型用 `reference_hf.py`。（§7.5）
+5. **找复杂 kernel / 逻辑的单测当「活文档」**：`python -m sglang.srt.mem_cache.radix_cache`、`test_build_tree_kernel_efficient` 等带硬编码断言的入口，比读代码快得多。（§7.4 / §8.4）
+6. **卡住（hang）就 `py-spy dump` 看每个进程卡在哪一行**，崩溃看父进程的 `SIGQUIT` traceback（不是子进程那一段）。（§8.2）
+7. **内存泄漏靠不变量自检**：idle 时 `check_memory` 会校验 KV / req slot 守恒，改了任何 alloc/free 路径后长跑看它有没有报 `memory leak detected`。（§5.3 / §8.5）
+
+---
+
 ## 1. 一句话职责
 
 本章是「需求 / 现象 → 代码位置」的全局索引：把改代码的入手点、各模块 bug 高发区、profiling/metrics 开关、以及最小复现环路，集中成一份可直接动手的操作手册。
@@ -395,6 +409,65 @@ python -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3.1-8B-Instr
 ### 7.6 二分定位多进程 / 优化路径
 
 确认 bug 在「哪条路径」上，逐个关优化（§5.6）：先 `--disable-cuda-graph`（graph 问题？）→ 再 `--disable-overlap-schedule`（overlap 问题？）→ 再 `--disable-radix-cache`（cache 脏 KV 问题？）。每关一个跑一遍，bug 在哪一步消失，问题就在那条路径里。scheduler 崩溃时父进程会收到 `SIGQUIT`（`scheduler.py:2326`），完整 traceback 在父进程日志里 —— 子进程的异常不要只看子进程那一段。
+
+---
+
+## 8. 进阶调试技巧（§5/§7 之外的巧思）
+
+前面 §5（日志/metrics/profiling）和 §7（最小复现环路）已经覆盖了主干。这一节补的是**多进程系统特有**、容易被新人忽略、但一旦掌握就能省大量时间的技巧。
+
+### 8.1 用 `rid` 当「贯穿三进程的探针」
+
+SGLang 最反直觉的调试难点是：**一条请求的处理被切碎在三个进程里**（TokenizerManager / Scheduler / DetokenizerManager），任何一个进程的日志单看都只是「半截故事」。唯一能把它们缝起来的是 `rid`（请求在 `io_struct.py` 生成的 uuid，见 [生命周期](01-request-lifecycle.md) §②）。
+
+- 开 `--log-requests`（配合 `--log-requests-level` 调详细度）让 TokenizerManager 打印每条请求的 `Receive`/`Finish`，带 `rid` 和参数。
+- 排查「请求卡住不返回」时：按 `rid` 依次确认它**走到了哪个进程就没动了**——Scheduler 收到了吗？进 `waiting_queue` 了吗？`process_batch_result` 发出 `BatchTokenIDOut` 了吗？DetokenizerManager 收到了吗？TokenizerManager 的 `_handle_batch_output` 按 `rid` 找到 `state` 了吗（还是报 "state was deleted"）？
+- 自己加临时日志时，**第一个字段永远打 `rid`**，否则多请求并发时日志无法归并。
+
+### 8.2 进程 hang / 卡死：`py-spy` + 进程名
+
+逻辑 bug 能靠 print 抓，但**死锁 / 卡住**时进程不报错、不退出，print 也不会触发。这时：
+
+- **`py-spy dump --pid <pid>`**（无需重启、无需改代码）直接打印目标进程当前的 Python 调用栈，瞬间知道它卡在哪一行——是卡在 `recv_pyobj`（等不到上游消息）、`all_reduce`（某 rank 没到齐）、还是 `req.wait()`（P2P 配对不上）。多卡 hang 时对每个 rank 的进程都 dump 一次，对比谁在等谁。
+- **怎么找到是哪个 pid**：SGLang 用 `setproctitle` 给每个角色起了名字——`sglang::scheduler`、`sglang::detokenizer`、`sglang::data_parallel_controller` 等（见 [Worker 与并行](15-worker-parallelism.md)）。`ps aux | grep sglang::` 一眼定位角色。
+- 典型场景：[PD 分离](21-pd-disaggregation.md) 卡在 `Bootstrapping`、[EPLB](25-eplb-expert-parallel.md) 的 P2P 搬权重 hang、TP 下 grammar 不一致 hang（§5.7 的 `SYNC_TOKEN_IDS_ACROSS_TP`）——全靠 `py-spy` 看栈定位是谁没到齐。
+
+### 8.3 崩溃：看**父进程**的 traceback，不是子进程
+
+子进程（Scheduler 等）抛异常时，往往只在自己的日志里留半段栈，然后向父进程发 `SIGQUIT`（`scheduler.py` 的 `run_scheduler_process` 尾部、`tp_worker_overlap_thread.py`、`data_parallel_controller.py` 都有）。**完整的、可读的 traceback 在父进程日志里**。所以「server 突然整个退出」时，别盯着某个子进程的最后几行，往上翻到父进程捕获 `SIGQUIT` 打出的那一坨。
+
+### 8.4 把「单测 / `__main__`」当活文档和试验台
+
+读复杂 kernel / 数据结构时，**与其逐行啃实现，不如跑它的单测**——单测里的硬编码输入输出断言就是最精确的「行为规格」：
+
+- `python -m sglang.srt.mem_cache.radix_cache`（文件尾 `__main__`）：手动 insert 几个有公共前缀的序列，`pretty_print()` 看树长什么样、`match_prefix` 返回什么。理解 RadixAttention 半小时胜过看半天代码。
+- `test_build_tree_kernel_efficient`（[投机解码](20-speculative-eagle.md)）：给了 bs/topk/depth 具体值 + `positions`/`retrive_*` 的硬编码断言，是搞懂 EAGLE 候选树张量含义的唯一捷径。
+- 改算法时**反过来用**：先改单测的期望值表达你想要的新行为，再改实现让它通过——等于给自己先写好规格。
+- 离线复现算法：[EPLB](25-eplb-expert-parallel.md) 的 `rebalance_experts`、[采样](17-sampling-structured-output.md) 的 jump-forward `test_main` 都能脱离 server 单机喂构造输入验证。
+
+### 8.5 改了 alloc/free 路径？主动加不变量断言
+
+KV / req slot 泄漏是最难查的一类 bug，因为它**不立即报错**，而是长跑后慢慢耗尽。SGLang 的对策是 `check_memory`（§5.3）在 idle 时校验「守恒等式」。借鉴这个思路：
+
+- 你改了任何分配/释放路径（retract、chunked free、投机 KV evict、LoRA 换入换出），**先想清楚守恒等式是什么**（如「`available + evictable + protected == max_total`」），临时在你的改动点后面 `assert` 它。错误会在**第一次失衡时**就炸，而不是几千个请求后才 OOM——把「滞后的症状」变成「即时的断言失败」。
+- 同理，给 `ForwardBatch` 加字段进 CUDA graph 时（[模型执行](14-model-executor.md)），临时 assert「replay 时静态 buffer 的该字段 == 真实输入」，能立刻抓到忘了 `copy_` 的脏数据。
+
+### 8.6 回归 bug：`git bisect` + 固定最小命令
+
+「上周还好好的，今天输出变了」这类回归，手工读 diff 很慢。固定一条**确定性的最小复现命令**（贪心采样 `--temperature 0` + `bench_one_batch --correct` + 小模型 dummy 权重），然后 `git bisect run` 自动二分到引入问题的 commit。关键是复现命令必须**确定性**（关 overlap、关 cuda graph、greedy），否则 bisect 会被随机性误导。
+
+### 8.7 在热路径安全地打印
+
+Scheduler 主循环每个 token step 都跑，直接 `print` 会刷屏且拖慢到改变时序（掩盖 race）。技巧：
+
+- **按 rank 门控**：只在 `tp_rank == 0` 打，避免 N 卡 ×N 倍日志。
+- **按条件 / 抽样**：`if step % 100 == 0` 或只在某个特定 `rid` 命中时打。
+- **优先用现成的统计**：`log_prefill_stats` / `log_decode_stats`（§5.1）已经把每轮 batch 的关键量打出来了，先看它们，不够再加。
+- 调时序敏感的 bug（overlap、race）时，**用变量累积、最后一次性 dump**，而不是边跑边打——打印的 I/O 本身会改变时序。
+
+### 8.8 善用「降级开关之间的联动」反推
+
+§5.6 提到开关有自动联动（`torch_native` 连带关 cuda graph、某些后端关 overlap）。反过来用：当你「没设某开关它却变了」时，不要困惑——去读 `server_args.py` 的 post-init 调整段（`:285-461` 一带），它集中表达了「这些配置组合下系统实际跑的是什么」。**排查任何「实际行为和我设的参数不符」的问题，第一站永远是这段 + 启动日志里打印的最终 `server_args`。**
 
 ---
 
