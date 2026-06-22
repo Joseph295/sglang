@@ -550,10 +550,60 @@ torchao 走独立路径(LayeredModelLoader 就地 quantize_)。AWQ/GPTQ 依赖 v
 
 ---
 
+## 14. 多模态（VLM）输入处理
+
+横跨"分词"和"前向"两阶段,前后端都要改。三阶段:
+```
+分词: process_mm_data_async 图→N个特殊 token + 算 pixel_values
+ ─IPC─► 调度: pad_input_ids 占位 token 全换成图的 pad_value
+ ─► 前向: vision encoder 算 embedding → masked_scatter 替换占位
+```
+
+### 最巧妙 trick:内容 hash 当 token id
+> ★ **图像没有 token id**,无法像文本那样命中前缀缓存(13章)。方案:对 pixel_values 做 hash 取低 30 位当占位 token id(`pad_value=hash%(1<<30)`)。相同图→相同 pad_value→相同占位序列→**前缀命中 KV 复用**。pad_value 一身二职:前缀键 + forward 时 `isin` 定位替换位置。
+
+### forward:clamp + masked_scatter
+```python
+input_ids.clamp_(0, vocab_size-1)        # pad_value 高达 2^30 远超 vocab, 不 clamp 会越界
+inputs_embeds = embed_tokens(input_ids)  # 占位处是"垃圾"embedding
+inputs_embeds.masked_scatter(mask, vision_embedding)  # 整体覆盖
+```
+> ★ 先 clamp 算垃圾 embedding 再 scatter 覆盖——hash-as-token-id 的必然代价,被覆盖位置算什么无所谓。只在 prefill 且含 mm_inputs 时进多模态分支,decode 没新图直接 embed_tokens。
+
+### 两种占位策略 + cache
+连续重复型(Qwen-VL,isin 找连续段)/成对包裹型(Gemma3,`<start>...<end>`)。
+> ★ 成对策略坑:start/end 数量不等(前缀缓存截断了 im_start)会原样返回不替换,需"补 0 起点"兜底。**多模态默认不开 chunked prefill**(`mm_inputs=None`),MultiModalCache 主要服务跨请求复用同一张图。
+
+### processor 自动注册
+> ★ `import_processors` 扫包读 `models` 类属性注册。**import 失败被静默吞只打 warning**——"No processor registered"时先看启动日志 `Ignore import error`。
+
+接新 VLM:模型类实现 get_image_feature+pad_input_ids+forward 调 general_mm_embed_routine;processor 继承 BaseMultimodalProcessor 设 models 实现 process_mm_data_async。修 bug:embedding 数量 mismatch(占位区间 vs encoder 输出)、越界(没 clamp/没走 routine)、前缀不命中(hash 不稳定)。
+
+参考：[24-multimodal](24-multimodal.md)
+
+---
+
+## 全篇完结
+
+至此 14 节覆盖了 SGLang runtime 的**全部核心 + 全部高级特性**：
+
+```
+主链路:  0 架构 → 1 生命周期 → 2 调度 → 3 KV → 4 前向 → 5 采样 → 6 解码 → 7 并行 → 8 计算层
+高级特性: 9 投机解码 → 10 PD分离 → 11 EPLB → 12 LoRA → 13 量化 → 14 多模态
+```
+
+贯穿全栈的几个反复出现的主题(吃透它们 = 吃透 SGLang):
+- **多进程 + ZMQ + 增量传输**:绕 GIL、CPU/GPU 解耦,offset 层层做差。
+- **continuous batching + overlap**:GPU 永远满载、CPU/GPU 完全并行(future token ids)。
+- **RadixAttention 三层映射**:Req→槽位号→物理 KV,让"复用"成为可能(前缀缓存/投机KV/多模态 hash 都建立在此)。
+- **CUDA graph 固定地址**:padding 安全值、in-place 字段备份还原——投机/LoRA/DP attention 的 graph 难点同源。
+- **方法对象模式**:量化/LoRA 都是"换 method 不换 layer",新增方案不碰模型代码。
+- **token 边界 ≠ 字符边界**:detokenize 的 surr 前缀、jump-forward 的 retokenize、多模态的 byte 链,同一主题。
+
 ## 学习建议
 
 1. **动手胜过读**：`python -m sglang.srt.mem_cache.radix_cache` 玩 radix 树；`--disable-overlap-schedule` / `--disable-cuda-graph` 二分定位 bug。
 2. **用 rid 串日志**：开 `--log-requests`，一条 rid 贯穿三个进程。
 3. **四个枢纽断点**：`get_next_batch_to_run` / `run_batch` / `process_batch_result_decode` / `_handle_batch_output`。
 
-> 下一批追加：16 计算层（attention backend / MoE 算子）、20 投机解码、21 PD 分离 …
+> 全部 14 节已覆盖核心 + 高级特性。每节末尾链接对应参考章节,需要 file:line 细节时去参考手册查。
