@@ -512,6 +512,44 @@ y = x W + scaling*(x A^T)B^T    A:(r,in) B:(out,r) r≪in/out
 
 ---
 
+## 13. 量化（FP8 / INT4 / AWQ / GPTQ）
+
+承接 16 章"量化方法对象"。识别方案 → 替换每层乘法实现 → 加载阶段处理反量化/重打包/scale。
+
+### 策略工厂
+```
+QuantizationConfig (用什么) → get_quant_method(layer, prefix) → QuantizeMethodBase (这层怎么算)
+```
+> ★ **普通层和量化层在 LinearBase 看来一样,区别只在 quant_method 对象**(16章方法对象的落地)。新增方案只写 config+method 不碰模型代码。不是运行时阶段,而是**构建期+加载期**。
+
+### ① 识别
+> ★ **offline(GPTQ/AWQ/FP8 checkpoint)不需要 --quantization**(从 HF config 自动解析);**online(BF16 现场转 FP8)才需要**。同时给会冲突。**override_quantization_method** 自动把 gptq 升级成 gptq_marlin——同 checkpoint 在不同 GPU 跑不同 kernel,复现 bug 先看启动日志确认实际方案。
+
+### ② 层替换:只换 quant_method 成员
+```
+forward: output = self.quant_method.apply(self, x, bias)  # 调用方不知底层 FP8 还是 INT4
+```
+跳过逻辑三风格:FP8 ignored_layers / AWQ 子串 / GPTQ dynamic 正则。
+
+### ③ 权重生命周期:两段式(最该理解的设计)
+```
+create_weights(注册量化布局占位) → load(按磁盘格式填) → process_weights_after_loading(转 kernel 格式)
+```
+> ★ **为什么两段式**:磁盘格式(packed int32/per-tensor scale)≠kernel 格式(转置/per-channel/Marlin 重排),加载时转会和分片逻辑打架。**process_weights_after_loading 是唯一翻译层——几乎所有"能加载但乱码/精度暴跌"的 bug 都在这**。v2 weight loader 才懂 packed/分片,新方法名必须加进 WEIGHT_LOADER_V2_SUPPORTED。
+
+### ④ apply:weight-only vs w8a8(选型核心)
+> ★ **weight-only(AWQ/GPTQ)**:反量化权重→高精度 GEMM,省显存/带宽。**w8a8/FP8**:权重+激活都量化→低精度 Tensor Core,省计算。**小 batch decode 受带宽限→weight-only 收益大;大 batch prefill 受算力限→w8a8 收益大**。FP8 不支持 CUTLASS 的硬件退化 per-tensor 损精度(同模型 A100 vs 老卡精度不同的根因)。
+
+### 独立性
+torchao 走独立路径(LayeredModelLoader 就地 quantize_)。AWQ/GPTQ 依赖 vllm(monkey_patch isinstance);FP8/w8a8/blockwise/compressed-tensors 自带 sgl-kernel 不依赖。
+> ★ **MoE 量化是另一套接口**(FusedMoEMethodBase,3D 权重),别套用 linear 经验。
+
+修 bug:乱码→process_weights shape/dtype;TP 报错→AWQ group_size/pack_factor;以为跑 A 实际 B→看日志。调试:LinearBase.__init__ 打印 type(quant_method)确认未意外退化成 Unquantized。
+
+参考：[23-quantization](23-quantization.md)
+
+---
+
 ## 学习建议
 
 1. **动手胜过读**：`python -m sglang.srt.mem_cache.radix_cache` 玩 radix 树；`--disable-overlap-schedule` / `--disable-cuda-graph` 二分定位 bug。
